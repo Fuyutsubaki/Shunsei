@@ -25,7 +25,7 @@ jobs:
       # Runs a set of commands using the runners shell
       - name: Run a multi-line script
         run: |
-          apt update && apt install clang-10 googletest
+          sudo apt-get update && sudo apt-get install clang-10 googletest
           clang++-10 -std=c++2a test/test.cpp -lgtest -lgtest_main -lpthread
           ./a.out
           echo "これで勝ったおもうなよ"
