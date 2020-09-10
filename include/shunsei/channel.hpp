@@ -45,6 +45,11 @@ namespace detail{
         bool is_select;
         using Iter = typename std::list<Sudog>::iterator;
     };
+    template<std::size_t ...I, class F>
+    void integral_constant_each(std::index_sequence<I...>,F f){
+        int v[] = { (f(std::integral_constant<std::size_t,I>{}),0)...};
+        (void)v;
+    }
 }
 
 template<class value_type>
@@ -222,13 +227,6 @@ public:
         return enqueueSudog(recv_queue, sdg);
     }
 };
-namespace detail{
-    template<std::size_t ...I, class F>
-    void integral_constant_each(std::index_sequence<I...>,F f){
-        int v[] = { (f(std::integral_constant<std::size_t,I>{}),0)...};
-        (void)v;
-    }
-}
 
 
 template<class...T>
