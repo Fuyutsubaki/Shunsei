@@ -32,6 +32,16 @@ sei::Task<> recv(sei::Channel<int>&ch, sei::Channel<int>&done_ch, std::atomic<bo
     all_done.store(true);
 }
 
+// move only type
+sei::Task<> send_move(sei::Channel<std::unique_ptr<int>>&ch){
+    co_await ch.send(std::make_unique<int>(32));
+}
+
+sei::Task<> recv_move(sei::Channel<int>&ch){
+    auto x = co_await ch.recv();
+}
+
+
 //TEST(test_common, Ch)
 int main()
 {

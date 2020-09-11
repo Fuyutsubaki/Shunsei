@@ -45,6 +45,32 @@ namespace detail{
         bool is_select;
         using Iter = typename std::list<Sudog>::iterator;
     };
+
+    template<class Sudog>
+    static std::optional<Sudog> dequeueSudog(std::list<Sudog>&queue){
+        for(auto it = queue.begin();it != queue.end();++it){
+            if(it->is_select){
+                bool expected = false;
+                bool r = it->task->on_select_detect_wait.compare_exchange_strong(expected, true); //TODO
+                if(r){
+                    return *it; // selectの場合、要素の開放はselectの解放処理に任せる
+                }
+            }else{
+                auto x = *it;
+                queue.erase(it);
+                return x;
+            }
+        }
+        return {};
+    }
+
+    template<class Sudog>
+    static typename Sudog::Iter enqueueSudog(std::list<Sudog>&queue, Sudog sdg){
+        queue.push_back(sdg);
+        auto it = queue.end();
+        it--;
+        return it;
+    }
     template<std::size_t ...I, class F>
     void integral_constant_each(std::index_sequence<I...>,F f){
         int v[] = { (f(std::integral_constant<std::size_t,I>{}),0)...};
@@ -58,7 +84,7 @@ public:
     Channel(std::size_t limit):queue_limit(limit){}
     using SendSudog = detail::Sudog<value_type>;
     using RecvSudog = detail::Sudog<std::optional<value_type>>;
-    struct SendAwaiter {
+    struct [[nodiscard]] SendAwaiter {
         Channel&ch;
         value_type val;
         std::function<void()> f;
@@ -67,20 +93,21 @@ public:
         bool await_suspend(std::experimental::coroutine_handle<>) {
             std::scoped_lock lock{ch.mutex};
             auto task = current_goroutine;
-            bool r = ch.nonblock_send(&val);
+            bool r = nonblock_send();
             if(r)return false;
-            ch.block_send(SendSudog{&val,task,0,false});
+            enqueueSudog(ch.send_queue, SendSudog{&val,task,0,false});
             return true;
         }
+
         void await_resume() const noexcept {}
 
         // select用
         bool try_nonblock_exec(){
-            return ch.nonblock_send(val);
+            return nonblock_send();
         }
         void block_exec(std::size_t wakeup_id){
             auto task = current_goroutine;
-            it = ch.block_send(SendSudog{&val,task,wakeup_id,true});
+            it = enqueueSudog(ch.send_queue, SendSudog{&val,task,wakeup_id,true});
         }
         void release_sudog(){
             ch.send_queue.erase(it);
@@ -88,8 +115,27 @@ public:
         void invoke_callback(){
             f();
         }
+
+        bool nonblock_send()
+        {
+            if(ch.closed){
+                assert(false);
+            }
+            else if(auto opt = dequeueSudog(ch.recv_queue)){
+                auto sdg = *opt;
+                *sdg.val = std::move(val);
+                Scheduler::push_g(sdg.task, sdg.wakeup_id);
+                return true;
+            }
+            else if(ch.value_queue.size() < ch.queue_limit){
+                ch.value_queue.push_back(std::move(val));
+                return true;
+            }
+            return false;
+        }
     };
-    struct RecvAwaiter {
+
+    struct [[nodiscard]] RecvAwaiter {
         Channel&ch;
         std::optional<value_type> val;
         std::function<void(std::optional<value_type>)> f;
@@ -98,19 +144,19 @@ public:
         bool await_suspend(std::experimental::coroutine_handle<>) {
             std::scoped_lock lock{ch.mutex};
             auto task = current_goroutine;
-            bool r = ch.nonblock_recv(val);
+            bool r = nonblock_recv();
             if(r)return false;
-            ch.block_recv(RecvSudog{&val,task,0,false});
+            enqueueSudog(ch.recv_queue, RecvSudog{&val,task,0,false});
             return true;
         }
         auto await_resume() const noexcept {return val; }
 
         bool try_nonblock_exec(){
-            return ch.nonblock_recv(&val);
+            return nonblock_recv();
         }
         void block_exec(std::size_t wakeup_id){
             auto task = current_goroutine;
-            it = ch.block_recv(RecvSudog{&val,task,wakeup_id ,true});
+            it = enqueueSudog(ch.recv_queue, RecvSudog{&val,task,wakeup_id ,true});
         }
         void release_sudog(){
             ch.recv_queue.erase(it);
@@ -118,23 +164,42 @@ public:
         void invoke_callback(){
             f(val);
         }
+
+        bool nonblock_recv(){
+            if(ch.value_queue.size() > 0){
+                val = ch.value_queue.front();
+                ch.value_queue.pop_front();
+                if(auto opt = dequeueSudog(ch.send_queue)){
+                    auto sdg = *opt;
+                    ch.value_queue.push_back(*sdg.val);
+                    Scheduler::push_g(sdg.task, sdg.wakeup_id);
+                }
+                return true;
+            }
+            else if(ch.closed){
+                val = std::nullopt;
+                return true;
+            }
+            else if(auto opt = dequeueSudog(ch.send_queue)){
+                auto sdg = *opt;
+                val = std::move(*sdg.val);
+                Scheduler::push_g(sdg.task, sdg.wakeup_id);
+                return true;
+            }
+            return false;
+        }
     };
 
-    SendAwaiter send(value_type val){
-        return SendAwaiter{*this, val, [](auto...){}};
+    template<class T>
+    SendAwaiter send(T && val, std::function<void()> f = [](auto...){}){
+        return SendAwaiter{*this, std::forward<T>(val), f};
     }
-    SendAwaiter send(value_type val, std::function<void()> f){
-        return SendAwaiter{*this, val, f};
-    }
-    RecvAwaiter recv(){
-        return RecvAwaiter{*this, {}, [](auto...){}};
-    }
-    RecvAwaiter recv(std::function<void(std::optional<value_type>)> f){
-        return RecvAwaiter{*this, {}, f};
+
+    RecvAwaiter recv(std::function<void(std::optional<value_type>)> f = [](auto...){}){
+        return RecvAwaiter{*this, std::nullopt, f};
     }
 
     void close(){ 
-        //C++的にはこの関数は存在自体に疑問がある
         std::scoped_lock lock{mutex};
         closed = true;
         while(auto opt = dequeueSudog(send_queue)){
@@ -147,7 +212,6 @@ public:
         }
     }
 
-//private:
     std::mutex mutex;
     std::size_t queue_limit;
     std::deque<value_type> value_queue;
@@ -155,82 +219,11 @@ public:
     std::list<RecvSudog> recv_queue;
     std::list<SendSudog> send_queue;
     bool closed = false;
-    template<class Sudog>
-    static std::optional<Sudog> dequeueSudog(std::list<Sudog>&queue){
-        for(auto it = queue.begin();it != queue.end();++it){
-            if(it->is_select){
-                bool expected = false;
-                bool r = it->task->on_select_detect_wait.compare_exchange_strong(expected, true); //TODO
-                if(r){
-                    return *it; // selectの場合、要素の開放はselectの解放処理に任せる
-                }
-            }else{
-                auto x = *it;
-                queue.erase(it);
-                return *it;
-            }
-        }
-        return {};
-    }
-    template<class Sudog>
-    static typename Sudog::Iter enqueueSudog(std::list<Sudog>&queue, Sudog sdg){
-        queue.push_back(sdg);
-        auto it = queue.end();
-        it--;
-        return it;
-    }
 
-    bool nonblock_send(value_type *val){
-        if(closed){
-            assert(false);
-        }
-        else if(auto opt = dequeueSudog(recv_queue)){
-            auto sdg = *opt;
-            *sdg.val = *val;
-            Scheduler::push_g(sdg.task, sdg.wakeup_id);
-            return true;
-        }
-        else if(value_queue.size() < queue_limit){
-            value_queue.push_back(*val);
-            return true;
-        }
-        return false;
-    }
-    typename SendSudog::Iter block_send(SendSudog sdg){
-        return enqueueSudog(send_queue, sdg);
-    }
-
-    bool nonblock_recv(std::optional<value_type> *val){
-        if(value_queue.size() > 0){
-            *val = value_queue.front();
-            value_queue.pop_front();
-            if(auto opt = dequeueSudog(send_queue)){
-                auto sdg = *opt;
-                value_queue.push_back(*sdg.val);
-                Scheduler::push_g(sdg.task, sdg.wakeup_id);
-            }
-            return true;
-        }
-        else if(closed){
-            *val = std::nullopt;
-            return true;
-        }
-        else if(auto opt = dequeueSudog(send_queue)){
-            auto sdg = *opt;
-            *val = *sdg.val;
-            Scheduler::push_g(sdg.task, sdg.wakeup_id);
-            return true;
-        }
-        return false;
-    }
-    typename RecvSudog::Iter block_recv(RecvSudog sdg){
-        return enqueueSudog(recv_queue, sdg);
-    }
 };
 
-
 template<class...T>
-struct SelectAwaiter{
+struct [[nodiscard]] SelectAwaiter{
     std::tuple<T...> sc_list;
     static constexpr std::size_t N = sizeof...(T);
 
@@ -245,8 +238,7 @@ struct SelectAwaiter{
             [&](auto I){
                 if(!r){
                     r = std::get<I()>(sc_list).try_nonblock_exec();
-                    if(r)
-                    {
+                    if(r){
                         wakeup_id = I();
                     }
                 }

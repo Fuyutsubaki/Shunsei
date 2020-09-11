@@ -1,7 +1,7 @@
 #pragma once
 #include <experimental/coroutine>
 #include<mutex>
-#include<iostream>
+#include<atomic>
 namespace sei{
 
 struct Goroutine;
